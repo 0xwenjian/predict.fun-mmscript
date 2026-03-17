@@ -198,9 +198,16 @@ class PredictSoloMonitor:
         market_key, outcome = self._parse_market_input(raw)
 
         cache_key = f"{market_key}:{outcome}"
+        # 如果缓存中已有且是同一个 URL/ID，避免重复解析日志
         if cache_key in self.market_cache:
             return self.market_cache[cache_key]
 
+        # 1. 尝试从网页直接提取
+        market_id = None
+        info = None
+        
+        # 降级不必要的解析日志
+        logger.debug(f"正在从网页解析 {market_key} (选项: {outcome}) ...")
         # 如果是纯数字，直接用作 market_id
         # 否则当作 slug，搜索转换
         if not market_key.isdigit():
@@ -210,7 +217,7 @@ class PredictSoloMonitor:
                 cache_key = f"{market_key}:{outcome}"
             else:
                 logger.error(f"无法通过 slug 找到市场: {market_key}")
-                logger.info(f"请改用数字 ID，方法: 浏览器打开市场页面 → F12 开发者工具 → Network → 搜索 marketId")
+                logger.debug(f"请改用数字 ID，方法: 浏览器打开市场页面 → F12 开发者工具 → Network → 搜索 marketId")
                 return None
 
         info = self.client.fetch_market_info(market_key)
@@ -236,16 +243,15 @@ class PredictSoloMonitor:
                 outcome_name = name
                 break
 
+        if not token_id and outcomes:
+            first = outcomes[0]
+            token_id = first.get('onChainId') or first.get('tokenId')
+            outcome_name = first.get('name', outcome)
+            logger.debug(f"未精确匹配 '{outcome}'，使用第一个选项: {outcome_name}")
+
         if not token_id:
-            # 默认取第一个 outcome
-            if outcomes:
-                first = outcomes[0]
-                token_id = first.get('onChainId') or first.get('tokenId')
-                outcome_name = first.get('name', outcome)
-                logger.warning(f"未精确匹配 '{outcome}'，使用第一个选项: {outcome_name}")
-            else:
-                logger.error(f"市场 {market_id} 无可用选项")
-                return None
+            logger.error(f"市场 {market_id} 无可用选项")
+            return None
 
         result = {
             'market_id': str(market_id),
@@ -258,7 +264,7 @@ class PredictSoloMonitor:
             'cache_key': cache_key,
         }
         self.market_cache[cache_key] = result
-        logger.info(f"解析市场: {title[:40]} -> [{outcome_name}] (ID:{market_id})")
+        logger.debug(f"解析成功: {title[:30]} -> {market_id}")
         return result
 
     # ── 核心价格逻辑 ──────────────────────────────────────────
@@ -344,6 +350,20 @@ class PredictSoloMonitor:
 
         return None
 
+    def _log_orderbook_depth(self, title: str, ob: OrderBook, target_price: float, target_rank: int):
+        """打印市场深度详情 (前 10 档)"""
+        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"[{title[:50]}] 市场深度 (前10档):")
+        
+        cumulative = 0.0
+        for i, lv in enumerate(ob.bids[:10]):
+            cumulative += lv.total
+            marker = " -> " if abs(lv.price - target_price) < 0.0005 else "    "
+            logger.info(f"{marker}买{i+1}: {lv.price:.4f} (本档: ${lv.total:,.0f} | 累计保护: ${cumulative:,.0f})")
+        
+        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"[下单准备] {title[:30]} | 目标价格: {target_price:.4f} (买{target_rank}价)")
+
     # ── 下单 ──────────────────────────────────────────────────
 
     def place_order(self, market_info: Dict) -> bool:
@@ -354,24 +374,20 @@ class PredictSoloMonitor:
             token_id = market_info['token_id']
             cache_key = market_info['cache_key']
 
-            # 用 market_id 获取订单簿 (API 只支持 market_id)
             ob = self.client.fetch_orderbook(market_id)
             if not ob or not ob.bids:
-                logger.warning(f"[{title[:25]}] 订单簿为空")
                 return False
 
             calc = self.calculate_best_price(ob)
             if not calc:
-                logger.info(f"[{title[:25]}] 无合格价格位置")
                 return False
 
             price, rank, protection, reason = calc
             amount = self.order_shares * price
 
-            logger.info(
-                f"[下单] {title[:30]} [{market_info['outcome']}] | "
-                f"价格:{price:.3f} 买{rank} | 份额:{self.order_shares} 金额:${amount:.2f} | {reason}"
-            )
+            # 打印详细深度日志
+            self._log_orderbook_depth(title, ob, price, rank)
+            logger.info(f"下单: {market_id} BUY {market_info['outcome']} ${amount:.2f} @ {price:.3f}")
 
             order_id = self.client.place_limit_order(
                 token_id, Side.BUY, amount, price,
@@ -390,7 +406,7 @@ class PredictSoloMonitor:
                     create_time=time.time(),
                     last_check_time=time.time()
                 )
-                logger.success(f"[挂单成功] {title[:30]} | {price:.3f} x {self.order_shares} | {order_id}")
+                logger.success(f"[挂单成功] {title[:30]} @ {price:.4f} (买{rank}价 ${protection:,.0f}) | 单号: {order_id}")
                 return True
             return False
         except Exception as e:
@@ -409,25 +425,20 @@ class PredictSoloMonitor:
 
                 ob = self.client.fetch_orderbook(minfo['market_id'])
                 if not ob:
-                    logger.warning(f"[{order.title[:20]}] 无法获取订单簿，保持现状")
                     continue
 
                 best_ask = ob.asks[0].price if ob.asks else 1.0
-                logger.info(f"[{order.title[:15]}] 正在检查盘口...")
-                logger.info(f"[{order.title[:20]}] 盘口状况: BestAsk={best_ask:.3f}, 得分线={best_ask-0.06:.3f}")
-
                 calc = self.calculate_best_price(ob)
 
                 if not calc:
                     # 完全无合格位置 → 撤单
-                    logger.info(f"[撤单] {order.title[:30]} | 无合格价格 | BestAsk={best_ask:.3f}")
+                    logger.info(f"执行调整(无合格价格): {order.price:.4f}(原挂单) | BestAsk={best_ask:.3f}")
                     if self.client.cancel_order(order.order_id):
                         del self.orders[cache_key]
-                        logger.success(f"[撤单成功] {order.title[:30]}")
+                        logger.success(f"撤单成功: {order.order_id}")
                     continue
 
                 new_price, new_rank, new_prot, reason = calc
-                logger.info(f"[{order.title[:20]}] 最新挂单计算结果: {new_price:.3f} (买{new_rank}) | {reason}")
 
                 # 价格无变化 → 跳过
                 if abs(new_price - order.price) <= 0.0005:
@@ -436,17 +447,14 @@ class PredictSoloMonitor:
                 # 买3稳定守卫: 如果当前已在买3以内，且新价格是向前(更高)，不改单
                 cur_rank, _ = self._get_rank_prot(ob, order.price)
                 if cur_rank <= 3 and new_price > order.price:
-                    logger.debug(f"[{order.title[:20]}] 已在买{cur_rank}，跳过前进 {order.price:.3f}->{new_price:.3f}")
                     continue
 
-                # 需要改单 → 记录订单簿详情
-                direction = "↑前进" if new_price > order.price else "↓后退"
-                bids_summary = ' | '.join([f"{lv.price:.3f}({lv.size:.0f}份/${lv.total:.0f})" for lv in ob.bids[:5]])
-                logger.info(
-                    f"[改单] {order.title[:25]} {direction} {order.price:.3f}(买{cur_rank})->{new_price:.3f}(买{new_rank}) | {reason}\n"
-                    f"       盘口: Ask1={best_ask:.3f} | Bids: {bids_summary}"
-                )
+                # 需要改单
+                direction = "前进" if new_price > order.price else "后退"
+                logger.info(f"执行调整({direction}): {order.price:.4f}(买{cur_rank}) -> {new_price:.4f}(买{new_rank})")
+                
                 if self.client.cancel_order(order.order_id):
+                    logger.success(f"订单取消成功: {order.order_id}")
                     del self.orders[cache_key]
                     self.place_order(minfo)
 
@@ -564,12 +572,12 @@ class PredictSoloMonitor:
             while self.running:
                 loop_counter += 1
                 
-                # 心跳日志 (控制台可见)
+                # 心跳日志
                 if self.orders:
                     active_info = [f"{o.title[:12]}@{o.price:.3f}" for o in self.orders.values()]
-                    logger.info(f"--- 周期 {loop_counter} | 监控中: {active_info} ---")
+                    logger.debug(f"--- 周期 {loop_counter} | 监控中: {active_info} ---")
                 else:
-                    logger.info(f"--- 周期 {loop_counter} | 等待挂单 ---")
+                    logger.debug(f"--- 周期 {loop_counter} | 等待挂单 ---")
 
                 self._maintain_orders()
                 self._scan_new_orders()

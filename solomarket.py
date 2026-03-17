@@ -626,8 +626,8 @@ def setup_logging(log_dir="log"):
     # 文件日志过滤器：屏蔽每3秒一次的周期性心跳，仅保留实际动作
     def file_filter(record):
         msg = record["message"]
-        # 屏蔽名单：心跳信息不写入文件
-        if "周期" in msg and "监控中" in msg: return False
+        # 屏蔽名单：心跳信息（包含“滴答”和“周期”）不写入文件
+        if "滴答" in msg and "周期" in msg: return False
         if "正在检查盘口" in msg: return False
         if "盘口状况" in msg: return False
         if "最新挂单计算结果" in msg: return False

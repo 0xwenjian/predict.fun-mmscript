@@ -1,11 +1,13 @@
-用我脚本的老师欢迎走我的邀请链接：https://predict.fun?ref=A5A1D
+
 
 # Predict.fun Solo Market 自动挂单脚本
 
+## 用我脚本的老师欢迎走我的邀请链接：https://predict.fun?ref=A5A1D
+**Author**: @0xwenjian
 现在有的脚本都太复杂了，这个bot自动在 Predict.fun 市场挂单做市，赚取平台积分。
 行情不好没必要用那么精细的脚本。0撸就完事了。
 
-**Author**: @0xwenjian
+
 
 ---
 
@@ -43,7 +45,6 @@ solo_market:
     - "https://predict.fun/market/cs2-prv-nip-2026-03-19:PARI"  URL + 选项名称
 ```
 
-> 市场 ID 可在 predict.fun 网页的 URL 或页面源码中找到。
 
 ### 核心参数
 
@@ -80,9 +81,8 @@ python3 solomarket.py --config-file config/account_2.config.yaml
 
 脚本每 **3 秒** 检查一次：
 - 已挂订单是否仍合格 → 不合格则撤单
-- **买3价格守卫**：如果当前已在买1-买3以内，且新价格是向前调整（更高），则**跳过改单**以减少手续费和频繁撤单。
+- **买3价格守卫**：如果当前已在买1-买3以内，且新价格是向前调整（更高），则**跳过改单**以减少频繁撤单。
 - 最佳价格是否变化（且触发后退或掉出买3） → 改单
-- 扫描候选池补位 (如果 `markets` 列表有新内容)
 
 ### Telegram 报告
 

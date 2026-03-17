@@ -614,9 +614,12 @@ class PredictSoloMonitor:
 
 # ── 日志 & 入口 ──────────────────────────────────────────────
 
-def setup_logging(log_dir="log"):
+def setup_logging(log_dir="log", account_id="default"):
     os.makedirs(log_dir, exist_ok=True)
     logger.remove()
+    
+    # 获取日期字符串
+    date_str = datetime.now().strftime("%Y%m%d")
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>",
@@ -633,11 +636,11 @@ def setup_logging(log_dir="log"):
         if "最新挂单计算结果" in msg: return False
         return True
 
-    log_file = os.path.join(log_dir, f"predict_{datetime.now():%Y%m%d}.log")
+    log_file = os.path.join(log_dir, f"predict_{account_id}_{date_str}.log")
     logger.add(log_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
                level="INFO", rotation="00:00", retention="30 days", encoding="utf-8",
                filter=file_filter)
-    events_file = os.path.join(log_dir, f"events_{datetime.now():%Y%m%d}.log")
+    events_file = os.path.join(log_dir, f"events_{account_id}_{date_str}.log")
     logger.add(events_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
                level="SUCCESS", rotation="00:00", retention="90 days", encoding="utf-8",
                filter=lambda r: r["level"].name in ["SUCCESS", "ERROR", "CRITICAL"])
@@ -652,7 +655,11 @@ def main():
     parser.add_argument("--log-dir", default="log")
     args = parser.parse_args()
 
-    setup_logging(args.log_dir)
+    # 从 config 文件名推导 account_id: account_1.config.yaml -> account_1
+    cfg_base = os.path.basename(args.config_file)
+    account_id = cfg_base.split('.')[0]
+    
+    setup_logging(args.log_dir, account_id)
 
     # 加载 env: 优先用 --env-file, 否则从 config 文件名推导
     env_candidates = []

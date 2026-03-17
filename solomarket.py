@@ -150,7 +150,7 @@ class PredictSoloMonitor:
                 m = re.search(r'marketId=(\d+)', resp.text)
                 if m:
                     mid = m.group(1)
-                    logger.success(f"网页解析成功: slug '{slug}' -> market ID {mid}")
+                    logger.debug(f"网页解析成功: slug '{slug}' -> market ID {mid}")
                     return mid
                 else:
                     logger.debug(f"og:image 中未找到 marketId (slug={slug})，尝试从网页数据块提取...")
@@ -165,7 +165,7 @@ class PredictSoloMonitor:
                                 all_ids = re.findall(r'\"id\":\"(\d+)\"', text_before)
                                 if all_ids:
                                     mid = all_ids[-1]
-                                    logger.success(f"多选项专项解析成功: 选项 '{outcome}' -> market ID {mid}")
+                                    logger.debug(f"多选项专项解析成功: 选项 '{outcome}' -> market ID {mid}")
                                     return mid
                     
                     # 方案2: 对于多选市场 (如 polymarket-fdv...)，从 Next.js 脱水数据中提取 category ID
@@ -175,14 +175,14 @@ class PredictSoloMonitor:
                             re.search(r'\"category\":\{\"id\":\"(\d+)\"', resp.text)
                     if m_cat:
                         mid = m_cat.group(1)
-                        logger.success(f"网页数据解析成功: slug '{slug}' -> market ID {mid}")
+                        logger.debug(f"网页数据解析成功: slug '{slug}' -> market ID {mid}")
                         return mid
                     
                     # 方案3: 模糊搜索 id 邻近 categorySlug
                     m_near = re.search(r'\"id\":\"(\d+)\"[^\}]*?\"categorySlug\":\"'+slug+r'\"', resp.text.replace('\\\"', '\"'))
                     if m_near:
                         mid = m_near.group(1)
-                        logger.success(f"网页结构解析成功: slug '{slug}' -> market ID {mid}")
+                        logger.debug(f"网页结构解析成功: slug '{slug}' -> market ID {mid}")
                         return mid
                         
                     logger.warning(f"所有网页解析方案均未找到对应 slug 的市场 ID (slug={slug})")
@@ -572,12 +572,12 @@ class PredictSoloMonitor:
             while self.running:
                 loop_counter += 1
                 
-                # 心跳日志
+                # 周期性信息 (INFO)
                 if self.orders:
-                    active_info = [f"{o.title[:12]}@{o.price:.3f}" for o in self.orders.values()]
-                    logger.debug(f"--- 周期 {loop_counter} | 监控中: {active_info} ---")
+                    active_titles = [o.title[:15] for o in self.orders.values()]
+                    logger.info(f"--- 滴答 [周期 {loop_counter}] 正在监控 {len(self.orders)} 个订单: {active_titles} ---")
                 else:
-                    logger.debug(f"--- 周期 {loop_counter} | 等待挂单 ---")
+                    logger.info(f"--- 滴答 [周期 {loop_counter}] 寻找挂单机会 ---")
 
                 self._maintain_orders()
                 self._scan_new_orders()
@@ -609,7 +609,7 @@ def setup_logging(log_dir="log"):
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>",
-        level="DEBUG", colorize=True
+        level="INFO", colorize=True
     )
     
     # 文件日志过滤器：屏蔽每3秒一次的周期性心跳，仅保留实际动作

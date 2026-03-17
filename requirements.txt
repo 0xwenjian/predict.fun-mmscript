@@ -1,0 +1,7 @@
+predict-sdk
+loguru
+pyyaml
+requests
+python-dotenv
+eth-account
+web3

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# 环境变量和配置
+.env
+*.env
+!.env_example
+
+# 日志文件
+log/
+*.log
+*.log.*
+*.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# 临时文件
+*.tmp
+*.bak
+
+# 配置文件
+config/*.yaml
+config/*.env
+!config/config_example.yaml

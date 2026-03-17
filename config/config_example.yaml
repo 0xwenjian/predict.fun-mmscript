@@ -1,0 +1,32 @@
+# Solo Market 配置模板
+# 复制此文件为 account_1.config.yaml 并修改
+
+solo_market:
+  # 市场列表 — 支持以下格式:
+  #   - "12474"         市场数字 ID (默认买第一个选项)
+  #   - "12474:NIP"     市场 ID + 选项名称
+  markets:
+    - "12474:PARI"  # CS2: PARIVISION vs NIP
+
+  # 最小前方保护金额 (美元)
+  # 优先级 2: 得分范围内有保护足够的位置时优先选那里
+  # 如果没有足够保护，仍会在得分范围内下单 (得分优先)
+  min_protection_amount: 500.0
+
+  # 每次挂单的固定份额数量
+  order_shares: 101
+
+  # 最大同时挂单数量
+  max_active_orders: 1
+
+# Telegram 通知 (每 2 小时发送状态报告)
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""
+
+# 代理
+proxy:
+  enabled: false
+  http: "http://127.0.0.1:7890"
+  https: "http://127.0.0.1:7890"

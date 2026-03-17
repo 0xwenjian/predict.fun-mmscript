@@ -1,6 +1,7 @@
 # Predict.fun Solo Market 自动挂单脚本
 
-自动在 Predict.fun 市场挂单做市，赚取平台积分。
+现在有的脚本都太复杂了，这个bot自动在 Predict.fun 市场挂单做市，赚取平台积分。
+行情不好没必要用那么精细的脚本。0撸就完事了。
 
 **Author**: @0xwenjian
 
@@ -37,8 +38,7 @@ python3 solomarket.py --sim --config-file config/account_1.config.yaml
 ```yaml
 solo_market:
   markets:
-    - "12474:PARI"   # 市场 ID + 选项名称
-    - "12475"        # 纯市场 ID (默认买第一个选项)
+    - "https://predict.fun/market/cs2-prv-nip-2026-03-19:PARI"  URL + 选项名称
 ```
 
 > 市场 ID 可在 predict.fun 网页的 URL 或页面源码中找到。

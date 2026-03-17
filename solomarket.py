@@ -51,7 +51,6 @@ class PredictSoloMonitor:
         self.markets_input = solo.get('markets', [])
         self.min_protection = solo.get('min_protection_amount', 500.0)
         self.order_shares = solo.get('order_shares', 101)
-        self.max_active_orders = solo.get('max_active_orders', 1)
 
         load_dotenv()
 
@@ -408,49 +407,51 @@ class PredictSoloMonitor:
                 if not minfo:
                     continue
 
-                # 每3秒轮询时的日志：获取订单簿
-                logger.info(f"[{order.title[:15]}] 正在检查盘口...")
                 ob = self.client.fetch_orderbook(minfo['market_id'])
                 if not ob:
-                    logger.warning(f"[{order.title[:20]}] 无法获取订单簿 (MarketID: {minfo['market_id']})，保持现状")
+                    logger.warning(f"[{order.title[:20]}] 无法获取订单簿，保持现状")
                     continue
 
                 best_ask = ob.asks[0].price if ob.asks else 1.0
-                logger.info(f"[{order.title[:20]}] 盘口状况: BestAsk={best_ask:.3f}, 得分线={best_ask-0.06:.3f}")
-
                 calc = self.calculate_best_price(ob)
 
                 if not calc:
                     # 完全无合格位置 → 撤单
-                    logger.info(f"[撤单] {order.title[:30]} | 无合格价格")
+                    logger.info(f"[撤单] {order.title[:30]} | 无合格价格 | BestAsk={best_ask:.3f}")
                     if self.client.cancel_order(order.order_id):
                         del self.orders[cache_key]
                         logger.success(f"[撤单成功] {order.title[:30]}")
                     continue
 
                 new_price, new_rank, new_prot, reason = calc
-                logger.info(f"[{order.title[:20]}] 最新挂单计算结果: {new_price:.3f} (买{new_rank}) | {reason}")
 
-                # 价格有变化 → 改单
-                if abs(new_price - order.price) > 0.0005:  # 考虑精度问题，差距大于半个最小刻度
-                    direction = "↑前进" if new_price > order.price else "↓后退"
-                    logger.info(f"[改单] {order.title[:25]} {direction} {order.price:.3f}->{new_price:.3f} | {reason}")
-                    if self.client.cancel_order(order.order_id):
-                        del self.orders[cache_key]
-                        self.place_order(minfo)
+                # 价格无变化 → 跳过
+                if abs(new_price - order.price) <= 0.0005:
+                    continue
+
+                # 买3稳定守卫: 如果当前已在买3以内，且新价格是向前(更高)，不改单
+                cur_rank, _ = self._get_rank_prot(ob, order.price)
+                if cur_rank <= 3 and new_price > order.price:
+                    logger.debug(f"[{order.title[:20]}] 已在买{cur_rank}，跳过前进 {order.price:.3f}->{new_price:.3f}")
+                    continue
+
+                # 需要改单 → 记录订单簿详情
+                direction = "↑前进" if new_price > order.price else "↓后退"
+                bids_summary = ' | '.join([f"{lv.price:.3f}({lv.size:.0f}份/${lv.total:.0f})" for lv in ob.bids[:5]])
+                logger.info(
+                    f"[改单] {order.title[:25]} {direction} {order.price:.3f}(买{cur_rank})->{new_price:.3f}(买{new_rank}) | {reason}\n"
+                    f"       盘口: Ask1={best_ask:.3f} | Bids: {bids_summary}"
+                )
+                if self.client.cancel_order(order.order_id):
+                    del self.orders[cache_key]
+                    self.place_order(minfo)
 
             except Exception as e:
                 logger.error(f"维护订单异常 ({order.title[:20]}): {e}")
 
     def _scan_new_orders(self):
-        """步骤 B: 寻找新机会 (有空位时扫描候选池)"""
-        if len(self.orders) >= self.max_active_orders:
-            return
-
+        """步骤 B: 遍历所有配置的市场，未挂单的自动补位"""
         for raw in self.markets_input:
-            if len(self.orders) >= self.max_active_orders:
-                break
-
             minfo = self._resolve_market(raw)
             if not minfo:
                 continue
@@ -506,7 +507,7 @@ class PredictSoloMonitor:
             msg += f"⏰ 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             msg += f"━━━━━━━━━━━━━━━"
             self._send_tg(msg)
-            logger.info(f"状态报告已发送 ({len(self.orders)}/{self.max_active_orders})")
+            logger.info(f"状态报告已发送 ({len(self.orders)}/{len(self.markets_input)})")
         except Exception as e:
             logger.error(f"报告发送失败: {e}")
 
@@ -527,7 +528,7 @@ class PredictSoloMonitor:
         self.running = True
         logger.info("━━━ Solo Market 启动 ━━━")
         logger.info(f"市场: {self.markets_input}")
-        logger.info(f"最大挂单: {self.max_active_orders} | 固定份额: {self.order_shares} | 最小保护: ${self.min_protection}")
+        logger.info(f"市场数量: {len(self.markets_input)} | 固定份额: {self.order_shares} | 最小保护: ${self.min_protection}")
 
         self._scan_new_orders()
         self.send_status_report()
@@ -540,12 +541,12 @@ class PredictSoloMonitor:
             while self.running:
                 loop_counter += 1
                 
-                # 打印 3 秒周期的心跳（普通级别）
+                # 心跳只在控制台显示，不写入日志文件 (使用 DEBUG 级别)
                 if self.orders:
-                    active_titles = [o.title[:10] for o in self.orders.values()]
-                    logger.info(f"--- 滴答 [周期 {loop_counter}] 正在监控 {len(self.orders)} 个订单: {active_titles} ---")
+                    active_info = [f"{o.title[:12]}@{o.price:.3f}" for o in self.orders.values()]
+                    logger.debug(f"--- 周期 {loop_counter} | 监控中: {active_info} ---")
                 else:
-                    logger.info(f"--- 滴答 [周期 {loop_counter}] 寻找挂单机会 ---")
+                    logger.debug(f"--- 周期 {loop_counter} | 等待挂单 ---")
 
                 self._maintain_orders()
                 self._scan_new_orders()
@@ -577,11 +578,11 @@ def setup_logging(log_dir="log"):
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>",
-        level="INFO", colorize=True
+        level="DEBUG", colorize=True
     )
     log_file = os.path.join(log_dir, f"predict_{datetime.now():%Y%m%d}.log")
     logger.add(log_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
-               level="DEBUG", rotation="00:00", retention="30 days", encoding="utf-8")
+               level="INFO", rotation="00:00", retention="30 days", encoding="utf-8")
     events_file = os.path.join(log_dir, f"events_{datetime.now():%Y%m%d}.log")
     logger.add(events_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
                level="SUCCESS", rotation="00:00", retention="90 days", encoding="utf-8",
@@ -670,7 +671,6 @@ def main():
             self_m.markets_input = solo.get('markets', [])
             self_m.min_protection = solo.get('min_protection_amount', 500.0)
             self_m.order_shares = solo.get('order_shares', 101)
-            self_m.max_active_orders = solo.get('max_active_orders', 1)
             self_m.client = MockClient()
             self_m.orders = {}
             self_m.market_cache = {}

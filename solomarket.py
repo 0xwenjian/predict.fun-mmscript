@@ -413,6 +413,9 @@ class PredictSoloMonitor:
                     continue
 
                 best_ask = ob.asks[0].price if ob.asks else 1.0
+                logger.info(f"[{order.title[:15]}] 正在检查盘口...")
+                logger.info(f"[{order.title[:20]}] 盘口状况: BestAsk={best_ask:.3f}, 得分线={best_ask-0.06:.3f}")
+
                 calc = self.calculate_best_price(ob)
 
                 if not calc:
@@ -424,6 +427,7 @@ class PredictSoloMonitor:
                     continue
 
                 new_price, new_rank, new_prot, reason = calc
+                logger.info(f"[{order.title[:20]}] 最新挂单计算结果: {new_price:.3f} (买{new_rank}) | {reason}")
 
                 # 价格无变化 → 跳过
                 if abs(new_price - order.price) <= 0.0005:
@@ -452,6 +456,25 @@ class PredictSoloMonitor:
     def _scan_new_orders(self):
         """步骤 B: 遍历所有配置的市场，未挂单的自动补位"""
         for raw in self.markets_input:
+            # 先用 _parse_market_input 获取 cache_key，检查是否已有挂单
+            market_key, outcome = self._parse_market_input(raw)
+            cache_key = f"{market_key}:{outcome}"
+            # 如果缓存中已有解析结果，用缓存的 cache_key
+            if cache_key in self.market_cache:
+                real_key = self.market_cache[cache_key].get('cache_key', cache_key)
+                if real_key in self.orders:
+                    continue
+            # 也直接检查所有已缓存的 key 是否在 orders 里
+            already_ordered = False
+            for ck in self.market_cache:
+                if self.market_cache[ck].get('cache_key', ck) in self.orders:
+                    # 检查是否是同一个 raw 输入
+                    if market_key in ck:
+                        already_ordered = True
+                        break
+            if already_ordered:
+                continue
+
             minfo = self._resolve_market(raw)
             if not minfo:
                 continue
@@ -541,12 +564,12 @@ class PredictSoloMonitor:
             while self.running:
                 loop_counter += 1
                 
-                # 心跳只在控制台显示，不写入日志文件 (使用 DEBUG 级别)
+                # 心跳日志 (控制台可见)
                 if self.orders:
                     active_info = [f"{o.title[:12]}@{o.price:.3f}" for o in self.orders.values()]
-                    logger.debug(f"--- 周期 {loop_counter} | 监控中: {active_info} ---")
+                    logger.info(f"--- 周期 {loop_counter} | 监控中: {active_info} ---")
                 else:
-                    logger.debug(f"--- 周期 {loop_counter} | 等待挂单 ---")
+                    logger.info(f"--- 周期 {loop_counter} | 等待挂单 ---")
 
                 self._maintain_orders()
                 self._scan_new_orders()
@@ -580,9 +603,21 @@ def setup_logging(log_dir="log"):
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>",
         level="DEBUG", colorize=True
     )
+    
+    # 文件日志过滤器：屏蔽每3秒一次的周期性心跳，仅保留实际动作
+    def file_filter(record):
+        msg = record["message"]
+        # 屏蔽名单：心跳信息不写入文件
+        if "周期" in msg and "监控中" in msg: return False
+        if "正在检查盘口" in msg: return False
+        if "盘口状况" in msg: return False
+        if "最新挂单计算结果" in msg: return False
+        return True
+
     log_file = os.path.join(log_dir, f"predict_{datetime.now():%Y%m%d}.log")
     logger.add(log_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
-               level="INFO", rotation="00:00", retention="30 days", encoding="utf-8")
+               level="INFO", rotation="00:00", retention="30 days", encoding="utf-8",
+               filter=file_filter)
     events_file = os.path.join(log_dir, f"events_{datetime.now():%Y%m%d}.log")
     logger.add(events_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
                level="SUCCESS", rotation="00:00", retention="90 days", encoding="utf-8",

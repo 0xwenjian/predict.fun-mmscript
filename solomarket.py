@@ -133,9 +133,9 @@ class PredictSoloMonitor:
     def _resolve_slug_to_id(self, slug: str, outcome: str = "") -> Optional[str]:
         """通过解析 Predict.fun 网页或 API，将 slug 转换为 market_id"""
         if outcome and outcome.upper() != "YES":
-            logger.info(f"正在从网页解析 {slug} (选项: {outcome}) 的 market ID ...")
+            logger.debug(f"正在从网页解析 {slug} (选项: {outcome}) 的 market ID ...")
         else:
-            logger.info(f"正在从网页解析 market ID: {slug} ...")
+            logger.debug(f"正在从网页解析 market ID: {slug} ...")
         import requests as _req
         import re
         try:
@@ -574,8 +574,19 @@ class PredictSoloMonitor:
                 
                 # 周期性信息 (INFO)
                 if self.orders:
-                    active_titles = [o.title[:15] for o in self.orders.values()]
-                    logger.info(f"--- 滴答 [周期 {loop_counter}] 正在监控 {len(self.orders)} 个订单: {active_titles} ---")
+                    active_info = []
+                    for cache_key, o in self.orders.items():
+                        # 获取实时位置
+                        rank = "?"
+                        minfo = self.market_cache.get(cache_key)
+                        if minfo:
+                            ob = self.client.fetch_orderbook(minfo['market_id'])
+                            if ob:
+                                rank_num, _ = self._get_rank_prot(ob, o.price)
+                                rank = f"买{rank_num}"
+                        active_info.append(f"{o.title[:12]}@{o.price:.3f}({rank})")
+                    
+                    logger.info(f"--- 滴答 [周期 {loop_counter}] 正在监控 {len(self.orders)} 个订单: {active_info} ---")
                 else:
                     logger.info(f"--- 滴答 [周期 {loop_counter}] 寻找挂单机会 ---")
 

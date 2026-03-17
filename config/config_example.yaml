@@ -16,8 +16,6 @@ solo_market:
   # 每次挂单的固定份额数量
   order_shares: 101
 
-  # 最大同时挂单数量
-  max_active_orders: 1
 
 # Telegram 通知 (每 2 小时发送状态报告)
 telegram:

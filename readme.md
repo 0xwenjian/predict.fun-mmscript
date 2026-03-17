@@ -48,7 +48,6 @@ solo_market:
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | `order_shares` | 每次挂单的固定份额 | `101` |
-| `max_active_orders` | 最大同时挂单数 | `1` |
 | `min_protection_amount` | 最小前方保护金额 ($) | `500` |
 
 ### 多账号
@@ -80,7 +79,7 @@ python3 solomarket.py --config-file config/account_2.config.yaml
 脚本每 **3 秒** 检查一次：
 - 已挂订单是否仍合格 → 不合格则撤单
 - 最佳价格是否变化 → 变化则改单
-- 有无空余挂单名额 → 有则扫描候选池补位
+- 扫描候选池补位 (如果 `markets` 列表有新内容)
 
 ### Telegram 报告
 

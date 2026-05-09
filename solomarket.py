@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Predict.fun Solo Market 自动挂单脚本
-用户提供市场 URL/ID，脚本自动计算最优价格并挂单
-优先级: 1) 得分 (价格在 BestAsk - 0.06 以内)  2) 前方保护 (> min_protection)
+用户提供市场 URL/ID，脚本按 BestAsk 驱动自动挂单
 """
 
 import os
@@ -42,15 +41,47 @@ def send_tg_notification(message: str, proxy: Dict = None):
 class PredictSoloMonitor:
     """Solo Market 自动挂单器"""
 
+    DEFAULT_SIDE = "YES"
+
+    @staticmethod
+    def _normalize_markets_input(markets) -> List[str]:
+        """兼容单个字符串和字符串列表两种配置写法。"""
+        if markets is None:
+            return []
+        if isinstance(markets, str):
+            value = markets.strip()
+            return [value] if value else []
+        if isinstance(markets, list):
+            result = []
+            for item in markets:
+                if item is None:
+                    continue
+                value = str(item).strip()
+                if value:
+                    result.append(value)
+            return result
+        raise ValueError("solo_market.markets 必须是字符串或字符串列表")
+
     def __init__(self, config: Dict):
         socket.setdefaulttimeout(20)
         self.config = config
         solo = config.get('solo_market', {})
 
         # 市场配置 (支持 URL / slug / market_id)
-        self.markets_input = solo.get('markets', [])
-        self.min_protection = solo.get('min_protection_amount', 500.0)
+        self.markets_input = self._normalize_markets_input(solo.get('markets', []))
+        self.option_name = (solo.get('option') or '').strip()
+        self.order_side = str(solo.get('YON', self.DEFAULT_SIDE)).strip().upper()
         self.order_shares = solo.get('order_shares', 101)
+        self.check_interval = int(solo.get('check_interval_seconds', 30))
+        self.target_offset = float(solo.get('target_offset_cents', 2.0)) / 100.0
+        self.lower_bound_offset = float(solo.get('lower_bound_offset_cents', 3.5)) / 100.0
+        self.upper_bound_offset = float(solo.get('upper_bound_offset_cents', 1.3)) / 100.0
+        if self.order_side not in {"YES", "NO"}:
+            raise ValueError("solo_market.YON 只能是 YES 或 NO")
+        if not (self.lower_bound_offset > self.target_offset > self.upper_bound_offset > 0):
+            raise ValueError(
+                "偏移参数必须满足: lower_bound_offset_cents > target_offset_cents > upper_bound_offset_cents > 0"
+            )
 
         load_dotenv()
 
@@ -130,20 +161,102 @@ class PredictSoloMonitor:
         outcome = parts[1].strip() if len(parts) > 1 else "YES"
         return key, outcome
 
+    def _get_market_option_and_side(self, raw: str) -> Tuple[str, str, str]:
+        """
+        返回 (market_key, option_name, side)
+
+        兼容两种写法:
+          1. 新配置:
+             markets: [url]
+             option: "500m"
+             YON: "NO"
+          2. 老配置:
+             markets: ["url:PARI"]  -> 默认买 PARI 的 YES
+             markets: ["url:NO"]    -> 二元市场买 NO
+        """
+        market_key, inline_outcome = self._parse_market_input(raw)
+        inline_outcome = inline_outcome.strip()
+
+        if self.option_name:
+            return market_key, self.option_name, self.order_side
+
+        if inline_outcome.upper() in {"YES", "NO"}:
+            return market_key, inline_outcome.upper(), inline_outcome.upper()
+
+        return market_key, inline_outcome, self.order_side
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return re.sub(r'[^a-z0-9]+', '', (value or '').lower())
+
+    def _pick_market_from_candidates(self, candidates: List[Dict], slug: str, option: str = "") -> Optional[str]:
+        """从分类或搜索结果里挑出最匹配的 market id。"""
+        if not candidates:
+            return None
+
+        normalized_option = self._normalize_text(option)
+        normalized_slug = self._normalize_text(slug)
+
+        if normalized_option:
+            for market in candidates:
+                texts = [
+                    market.get('title', ''),
+                    market.get('question', ''),
+                    market.get('categorySlug', ''),
+                ]
+                for outcome in market.get('outcomes', []) or []:
+                    texts.append(outcome.get('name', ''))
+
+                if any(normalized_option in self._normalize_text(text) for text in texts if text):
+                    return str(market.get('id'))
+
+        for market in candidates:
+            market_slug = market.get('categorySlug', '')
+            if market_slug and self._normalize_text(market_slug) == normalized_slug:
+                return str(market.get('id'))
+
+        if len(candidates) == 1:
+            return str(candidates[0].get('id'))
+
+        return None
+
     def _resolve_slug_to_id(self, slug: str, outcome: str = "") -> Optional[str]:
-        """通过解析 Predict.fun 网页或 API，将 slug 转换为 market_id"""
+        """优先通过官方 API，将 slug 转换为 market_id。"""
         if outcome and outcome.upper() != "YES":
-            logger.debug(f"正在从网页解析 {slug} (选项: {outcome}) 的 market ID ...")
+            logger.debug(f"正在通过 API 解析 {slug} (选项: {outcome}) 的 market ID ...")
         else:
-            logger.debug(f"正在从网页解析 market ID: {slug} ...")
+            logger.debug(f"正在通过 API 解析 market ID: {slug} ...")
+
+        category = self.client.fetch_category_by_slug(slug)
+        if category:
+            markets = category.get('markets', []) or []
+            picked = self._pick_market_from_candidates(markets, slug, outcome)
+            if picked:
+                logger.debug(f"分类解析成功: slug '{slug}' -> market ID {picked}")
+                return picked
+            logger.warning(f"分类已找到，但未在 slug={slug} 下匹配到选项 '{outcome}'")
+
+        search_candidates = self.client.search_markets(slug, limit=20)
+        picked = self._pick_market_from_candidates(search_candidates, slug, outcome)
+        if picked:
+            logger.debug(f"搜索解析成功: slug '{slug}' -> market ID {picked}")
+            return picked
+
+        if outcome:
+            search_candidates = self.client.search_markets(outcome, limit=20)
+            picked = self._pick_market_from_candidates(search_candidates, slug, outcome)
+            if picked:
+                logger.debug(f"选项搜索解析成功: slug '{slug}' / '{outcome}' -> market ID {picked}")
+                return picked
+
+        logger.debug(f"API 未解析出 slug={slug}，回退到网页解析")
         import requests as _req
         import re
         try:
-            # 方案1: 直接抓取网页内容 (适用于大多数单选市场)
             resp = _req.get(
                 f"https://predict.fun/market/{slug}",
                 headers={'User-Agent': 'Mozilla/5.0'},
-                proxies=self.proxy, timeout=10
+                proxies=self.proxy, timeout=5
             )
             if resp.ok:
                 # 网页的 og:image 链接通常包含 ?marketId=XXXX
@@ -195,9 +308,9 @@ class PredictSoloMonitor:
 
     def _resolve_market(self, raw: str) -> Optional[Dict]:
         """解析市场输入 -> 缓存信息 {market_id, title, token_id, outcome, fee_rate, ...}"""
-        market_key, outcome = self._parse_market_input(raw)
+        market_key, option_name, side = self._get_market_option_and_side(raw)
 
-        cache_key = f"{market_key}:{outcome}"
+        cache_key = f"{market_key}:{option_name}:{side}"
         # 如果缓存中已有且是同一个 URL/ID，避免重复解析日志
         if cache_key in self.market_cache:
             return self.market_cache[cache_key]
@@ -207,14 +320,14 @@ class PredictSoloMonitor:
         info = None
         
         # 降级不必要的解析日志
-        logger.debug(f"正在从网页解析 {market_key} (选项: {outcome}) ...")
+        logger.debug(f"正在从网页解析 {market_key} (选项: {option_name}, 方向: {side}) ...")
         # 如果是纯数字，直接用作 market_id
         # 否则当作 slug，搜索转换
         if not market_key.isdigit():
-            resolved_id = self._resolve_slug_to_id(market_key, outcome)
+            resolved_id = self._resolve_slug_to_id(market_key, option_name)
             if resolved_id:
                 market_key = resolved_id
-                cache_key = f"{market_key}:{outcome}"
+                cache_key = f"{market_key}:{option_name}:{side}"
             else:
                 logger.error(f"无法通过 slug 找到市场: {market_key}")
                 logger.debug(f"请改用数字 ID，方法: 浏览器打开市场页面 → F12 开发者工具 → Network → 搜索 marketId")
@@ -236,18 +349,29 @@ class PredictSoloMonitor:
 
         for o in outcomes:
             name = o.get('name', '').strip()
-            if (name.upper() == outcome.upper() or
-                (outcome.upper() == 'YES' and o.get('indexSet') == 1) or
-                (outcome.upper() == 'NO' and o.get('indexSet') == 2)):
+            if (name.upper() == option_name.upper() or
+                (option_name.upper() == 'YES' and o.get('indexSet') == 1) or
+                (option_name.upper() == 'NO' and o.get('indexSet') == 2)):
                 token_id = o.get('onChainId') or o.get('tokenId')
                 outcome_name = name
                 break
 
+        # 如果 option 只是用于选择某个子市场（例如 500m / 1b），
+        # 那么真正的二元下单方向由 side 决定。
+        if not token_id and side in {"YES", "NO"}:
+            target_index = 1 if side == "YES" else 2
+            for o in outcomes:
+                if o.get('indexSet') == target_index:
+                    token_id = o.get('onChainId') or o.get('tokenId')
+                    outcome_name = o.get('name', side)
+                    logger.debug(f"按交易方向 '{side}' 选择二元市场 token: {outcome_name}")
+                    break
+
         if not token_id and outcomes:
             first = outcomes[0]
             token_id = first.get('onChainId') or first.get('tokenId')
-            outcome_name = first.get('name', outcome)
-            logger.debug(f"未精确匹配 '{outcome}'，使用第一个选项: {outcome_name}")
+            outcome_name = first.get('name', option_name)
+            logger.debug(f"未精确匹配 '{option_name}'，使用第一个选项: {outcome_name}")
 
         if not token_id:
             logger.error(f"市场 {market_id} 无可用选项")
@@ -258,6 +382,7 @@ class PredictSoloMonitor:
             'title': title,
             'token_id': token_id,
             'outcome': outcome_name,
+            'side': side,
             'fee_rate': int(info.get('feeRateBps') or info.get('fee_rate_bps') or 100),
             'is_neg_risk': info.get('isNegRisk') or info.get('is_neg_risk') or False,
             'is_yield_bearing': info.get('isYieldBearing') or info.get('is_yield_bearing') or False,
@@ -269,100 +394,61 @@ class PredictSoloMonitor:
 
     # ── 核心价格逻辑 ──────────────────────────────────────────
 
-    def calculate_best_price(self, ob: OrderBook) -> Optional[Tuple[float, int, float, str]]:
-        """
-        计算最优挂单价格
-        优先级: 1) 得分 (在 BestAsk - 0.06 以内)  2) 保护 (> min_protection)
+    def _floor_price(self, price: float) -> float:
+        return max(0.001, math.floor(price * 1000) / 1000.0)
 
-        Returns:
-            (price, rank, protection, reason) 或 None
+    def _get_best_ask_for_side(self, ob: OrderBook, side: str) -> Optional[float]:
         """
-        if not ob or not ob.bids:
+        Predict API 的 orderbook 是基于 YES 价格返回的。
+        NO 侧最优卖价 = 1 - YES 最优买价。
+        """
+        if not ob:
             return None
 
-        best_ask = ob.asks[0].price if ob.asks else 1.0
-        min_score_price = best_ask - 0.06
+        side = side.upper()
+        if side == "YES":
+            if not ob.asks:
+                return None
+            return round(ob.asks[0].price, 3)
 
-        # 扫描 bids，累计保护金额
-        cumulative_protection = 0.0
-        best_safe_price = None  # 满足保护条件的最优价格
-        best_safe_rank = 0
-        best_safe_prot = 0.0
+        if not ob.bids:
+            return None
+        return round(1.0 - ob.bids[0].price, 3)
 
-        for i, level in enumerate(ob.bids):
-            cumulative_protection += level.total
-            # 价格精确到三位小数 (0.1美分)，减去最小刻度 0.001
-            target_price = math.floor((level.price - 0.001) * 1000) / 1000.0
-            if target_price < 0.001:
-                target_price = 0.001
-            rank = i + 2
+    def calculate_target_price(self, ob: OrderBook, side: str) -> Optional[Tuple[float, float, str]]:
+        """
+        首次下单 / 重新下单价格:
+          target_price = BestAsk - target_offset
+        """
+        best_ask = self._get_best_ask_for_side(ob, side)
+        if best_ask is None:
+            return None
 
-            # 检查是否在得分范围内
-            if target_price < min_score_price:
-                continue  # 价格太低，不得分，跳过
+        target_price = self._floor_price(best_ask - self.target_offset)
+        if target_price >= best_ask:
+            return None
 
-            # 在得分范围内，检查保护
-            if cumulative_protection >= self.min_protection and best_safe_price is None:
-                best_safe_price = target_price
-                best_safe_rank = rank
-                best_safe_prot = cumulative_protection
+        return (
+            round(target_price, 3),
+            round(best_ask, 3),
+            f"BestAsk {best_ask:.3f} - {self.target_offset:.3f}"
+        )
 
-        # 情况 1: 找到了同时满足得分+保护的位置 (最佳)
-        if best_safe_price is not None:
-            return (
-                round(best_safe_price, 3), best_safe_rank, best_safe_prot,
-                f"✅ 得分+保护 (保护=${best_safe_prot:,.0f})"
-            )
+    def is_order_qualified(self, order_price: float, best_ask: float) -> bool:
+        """
+        合格条件:
+          price >= BestAsk - lower_bound_offset
+          price <= BestAsk - upper_bound_offset
+        """
+        return (best_ask - self.lower_bound_offset) <= order_price <= (best_ask - self.upper_bound_offset)
 
-        # 情况 2: 得分范围内没有足够保护 → 仍然下单 (得分优先)
-        # 选择得分范围内最深的位置 (离 min_score_price 最近但仍 >= min_score_price)
-        best_score_price = None
-        best_score_rank = 0
-        best_score_prot = 0.0
-        cumulative_protection = 0.0
+    def get_qualified_floor_price(self, best_ask: float) -> float:
+        """返回存活区间下限，即 BestAsk - lower_bound_offset。"""
+        return self._floor_price(best_ask - self.lower_bound_offset)
 
-        for i, level in enumerate(ob.bids):
-            cumulative_protection += level.total
-            target_price = math.floor((level.price - 0.001) * 1000) / 1000.0
-            if target_price < 0.001:
-                target_price = 0.001
-            rank = i + 2
-
-            if target_price >= min_score_price:
-                # 记录这个位置（持续更新到最深的合格位置）
-                best_score_price = target_price
-                best_score_rank = rank
-                best_score_prot = cumulative_protection
-
-        if best_score_price is not None:
-            return (
-                round(best_score_price, 3), best_score_rank, best_score_prot,
-                f"⚠️ 得分OK但保护不足 (保护=${best_score_prot:,.0f} < ${self.min_protection:,.0f})"
-            )
-
-        # 情况 3: 没有 bids 在得分范围内 → 直接在 MinScorePrice 挂单 (保证得分)
-        if min_score_price >= 0.001:
-            target_price = math.floor(min_score_price * 1000) / 1000.0
-            return (
-                round(target_price, 3), 0, 0.0,
-                f"🔻 无前方买单，直接挂在得分线 (BestAsk {best_ask:.3f} - 0.06)"
-            )
-
-        return None
-
-    def _log_orderbook_depth(self, title: str, ob: OrderBook, target_price: float, target_rank: int):
-        """打印市场深度详情 (前 10 档)"""
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        logger.info(f"[{title[:50]}] 市场深度 (前10档):")
-        
-        cumulative = 0.0
-        for i, lv in enumerate(ob.bids[:10]):
-            cumulative += lv.total
-            marker = " -> " if abs(lv.price - target_price) < 0.0005 else "    "
-            logger.info(f"{marker}买{i+1}: {lv.price:.4f} (本档: ${lv.total:,.0f} | 累计保护: ${cumulative:,.0f})")
-        
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        logger.info(f"[下单准备] {title[:30]} | 目标价格: {target_price:.4f} (买{target_rank}价)")
+    def get_qualified_ceiling_price(self, best_ask: float) -> float:
+        """返回存活区间上限，即 BestAsk - upper_bound_offset。"""
+        return self._floor_price(best_ask - self.upper_bound_offset)
 
     # ── 下单 ──────────────────────────────────────────────────
 
@@ -375,19 +461,20 @@ class PredictSoloMonitor:
             cache_key = market_info['cache_key']
 
             ob = self.client.fetch_orderbook(market_id)
-            if not ob or not ob.bids:
+            if not ob:
                 return False
 
-            calc = self.calculate_best_price(ob)
+            calc = self.calculate_target_price(ob, market_info['side'])
             if not calc:
                 return False
 
-            price, rank, protection, reason = calc
+            price, best_ask, reason = calc
             amount = self.order_shares * price
 
-            # 打印详细深度日志
-            self._log_orderbook_depth(title, ob, price, rank)
-            logger.info(f"下单: {market_id} BUY {market_info['outcome']} ${amount:.2f} @ {price:.3f}")
+            logger.info(
+                f"下单: {market_id} BUY {market_info['outcome']}({market_info['side']}) "
+                f"${amount:.2f} @ {price:.3f} | {reason}"
+            )
 
             order_id = self.client.place_limit_order(
                 token_id, Side.BUY, amount, price,
@@ -406,7 +493,10 @@ class PredictSoloMonitor:
                     create_time=time.time(),
                     last_check_time=time.time()
                 )
-                logger.success(f"[挂单成功] {title[:30]} @ {price:.4f} (买{rank}价 ${protection:,.0f}) | 单号: {order_id}")
+                logger.success(
+                    f"[挂单成功] {title[:30]} {market_info['outcome']}({market_info['side']}) "
+                    f"@ {price:.4f} | BestAsk={best_ask:.3f} | 单号: {order_id}"
+                )
                 return True
             return False
         except Exception as e:
@@ -427,32 +517,28 @@ class PredictSoloMonitor:
                 if not ob:
                     continue
 
-                best_ask = ob.asks[0].price if ob.asks else 1.0
-                calc = self.calculate_best_price(ob)
-
-                if not calc:
-                    # 完全无合格位置 → 撤单
-                    logger.info(f"执行调整(无合格价格): {order.price:.4f}(原挂单) | BestAsk={best_ask:.3f}")
+                best_ask = self._get_best_ask_for_side(ob, minfo['side'])
+                if best_ask is None:
+                    logger.info(f"执行调整(无法获取BestAsk): {order.price:.4f}(原挂单)")
                     if self.client.cancel_order(order.order_id):
                         del self.orders[cache_key]
                         logger.success(f"撤单成功: {order.order_id}")
                     continue
 
-                new_price, new_rank, new_prot, reason = calc
-
-                # 价格无变化 → 跳过
-                if abs(new_price - order.price) <= 0.0005:
+                if self.is_order_qualified(order.price, best_ask):
                     continue
 
-                # 买3稳定守卫: 如果当前已在买3以内，且新价格是向前(更高)，不改单
-                cur_rank, _ = self._get_rank_prot(ob, order.price)
-                if cur_rank <= 3 and new_price > order.price:
+                calc = self.calculate_target_price(ob, minfo['side'])
+                if not calc:
                     continue
 
-                # 需要改单
-                direction = "前进" if new_price > order.price else "后退"
-                logger.info(f"执行调整({direction}): {order.price:.4f}(买{cur_rank}) -> {new_price:.4f}(买{new_rank})")
-                
+                new_price, _, reason = calc
+                logger.info(
+                    f"执行调整: {order.price:.4f}(原挂单) 已脱离存活区间 "
+                    f"[{self.get_qualified_floor_price(best_ask):.4f}, {self.get_qualified_ceiling_price(best_ask):.4f}] "
+                    f"| BestAsk={best_ask:.3f} | 新价格={new_price:.4f} ({reason})"
+                )
+
                 if self.client.cancel_order(order.order_id):
                     logger.success(f"订单取消成功: {order.order_id}")
                     del self.orders[cache_key]
@@ -465,8 +551,8 @@ class PredictSoloMonitor:
         """步骤 B: 遍历所有配置的市场，未挂单的自动补位"""
         for raw in self.markets_input:
             # 先用 _parse_market_input 获取 cache_key，检查是否已有挂单
-            market_key, outcome = self._parse_market_input(raw)
-            cache_key = f"{market_key}:{outcome}"
+            market_key, option_name, side = self._get_market_option_and_side(raw)
+            cache_key = f"{market_key}:{option_name}:{side}"
             # 如果缓存中已有解析结果，用缓存的 cache_key
             if cache_key in self.market_cache:
                 real_key = self.market_cache[cache_key].get('cache_key', cache_key)
@@ -506,7 +592,7 @@ class PredictSoloMonitor:
 
             order_total = sum(o.amount for o in self.orders.values())
 
-            msg = f"📊 <b>Solo Market 状态报告</b>\n"
+            msg = f"📊 <b>predict.fun脚本监控</b>\n"
             msg += f"━━━━━━━━━━━━━━━\n"
             msg += f"💰 可用余额: ${available:.2f}\n"
             msg += f"🔒 冻结余额: ${frozen:.2f}\n"
@@ -520,15 +606,23 @@ class PredictSoloMonitor:
                 minfo = self.market_cache.get(ck)
                 mid = minfo['market_id'] if minfo else '?'
 
-                # 获取实时排名和保护
-                rank, prot = 0, 0.0
+                best_ask = None
                 if minfo:
                     ob = self.client.fetch_orderbook(mid)
                     if ob:
-                        rank, prot = self._get_rank_prot(ob, order.price)
+                        best_ask = self._get_best_ask_for_side(ob, minfo['side'])
 
                 msg += f"\n📌 {order.title[:30]}\n"
-                msg += f"   价格: {order.price:.3f} | 买{rank}价 | 保护: ${prot:,.0f}\n"
+                side_label = minfo['side'] if minfo else self.order_side
+                outcome_label = minfo['outcome'] if minfo else '?'
+                best_ask_text = f"{best_ask:.3f}" if best_ask is not None else "?"
+                qualified_floor_text = f"{self.get_qualified_floor_price(best_ask):.3f}" if best_ask is not None else "?"
+                qualified_ceiling_text = f"{self.get_qualified_ceiling_price(best_ask):.3f}" if best_ask is not None else "?"
+                status = "合格" if best_ask is not None and self.is_order_qualified(order.price, best_ask) else "待调整"
+                msg += (
+                    f"   选项: {outcome_label}({side_label}) | 价格: {order.price:.3f} | "
+                    f"BestAsk: {best_ask_text} | 存活区间: [{qualified_floor_text}, {qualified_ceiling_text}] | {status}\n"
+                )
                 msg += f"   金额: ${order.amount:.0f} | 已挂: {hours:.1f}小时\n"
 
             if not self.orders:
@@ -542,24 +636,16 @@ class PredictSoloMonitor:
         except Exception as e:
             logger.error(f"报告发送失败: {e}")
 
-    def _get_rank_prot(self, ob: OrderBook, price: float) -> Tuple[int, float]:
-        if not ob:
-            return 0, 0.0
-        rank = 1
-        prot = ob.get_protection_amount("BUY", price)
-        for lv in ob.bids:
-            if lv.price > price + 0.0005: # 精度 0.001 级别
-                rank += 1
-            else:
-                break
-        return rank, prot
-
     def run(self):
-        """主循环 (3 秒)"""
+        """主循环"""
         self.running = True
         logger.info("━━━ Solo Market 启动 ━━━")
         logger.info(f"市场: {self.markets_input}")
-        logger.info(f"市场数量: {len(self.markets_input)} | 固定份额: {self.order_shares} | 最小保护: ${self.min_protection}")
+        logger.info(
+            f"市场数量: {len(self.markets_input)} | 选项: {self.option_name or '按市场单独解析'} "
+            f"| 方向: {self.order_side} | 固定份额: {self.order_shares} | 检查间隔: {self.check_interval}s "
+            f"| 目标偏移: {self.target_offset * 100:.1f}c | 存活区间: [{self.lower_bound_offset * 100:.1f}c, {self.upper_bound_offset * 100:.1f}c]"
+        )
 
         self._scan_new_orders()
         self.send_status_report()
@@ -578,13 +664,22 @@ class PredictSoloMonitor:
                     for cache_key, o in self.orders.items():
                         # 获取实时位置
                         rank = "?"
+                        best_ask_text = "?"
+                        qualified_floor_text = "?"
+                        qualified_ceiling_text = "?"
                         minfo = self.market_cache.get(cache_key)
                         if minfo:
                             ob = self.client.fetch_orderbook(minfo['market_id'])
                             if ob:
-                                rank_num, _ = self._get_rank_prot(ob, o.price)
-                                rank = f"买{rank_num}"
-                        active_info.append(f"{o.title[:12]}@{o.price:.3f}({rank})")
+                                best_ask = self._get_best_ask_for_side(ob, minfo['side'])
+                                if best_ask is not None:
+                                    best_ask_text = f"{best_ask:.3f}"
+                                    qualified_floor_text = f"{self.get_qualified_floor_price(best_ask):.3f}"
+                                    qualified_ceiling_text = f"{self.get_qualified_ceiling_price(best_ask):.3f}"
+                                    rank = "合格" if self.is_order_qualified(o.price, best_ask) else "待调"
+                        active_info.append(
+                            f"{o.title[:12]}@{o.price:.3f}({rank}, BestAsk={best_ask_text}, 存活区间=[{qualified_floor_text},{qualified_ceiling_text}])"
+                        )
                     
                     logger.info(f"--- 滴答 [周期 {loop_counter}] 正在监控 {len(self.orders)} 个订单: {active_info} ---")
                 else:
@@ -597,7 +692,7 @@ class PredictSoloMonitor:
                     self.send_status_report()
                     self.last_report_time = time.time()
 
-                time.sleep(3)
+                time.sleep(self.check_interval)
         except KeyboardInterrupt:
             logger.info("收到停止指令...")
         finally:
@@ -614,12 +709,43 @@ class PredictSoloMonitor:
 
 # ── 日志 & 入口 ──────────────────────────────────────────────
 
+class BoundedFileSink:
+    """将日志写入固定文件，并将文件大小限制在指定字节数内。"""
+
+    def __init__(self, path: str, max_bytes: int = 50 * 1024):
+        self.path = path
+        self.max_bytes = max_bytes
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def write(self, message):
+        text = str(message)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(text)
+        self._trim()
+
+    def _trim(self):
+        try:
+            size = os.path.getsize(self.path)
+            if size <= self.max_bytes:
+                return
+
+            with open(self.path, "rb") as f:
+                f.seek(-self.max_bytes, os.SEEK_END)
+                data = f.read()
+
+            newline_pos = data.find(b"\n")
+            if newline_pos != -1 and newline_pos + 1 < len(data):
+                data = data[newline_pos + 1:]
+
+            with open(self.path, "wb") as f:
+                f.write(data)
+        except OSError:
+            pass
+
 def setup_logging(log_dir="log", account_id="default"):
     os.makedirs(log_dir, exist_ok=True)
     logger.remove()
-    
-    # 获取日期字符串
-    date_str = datetime.now().strftime("%Y%m%d")
+
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | <level>{message}</level>",
@@ -636,14 +762,20 @@ def setup_logging(log_dir="log", account_id="default"):
         if "最新挂单计算结果" in msg: return False
         return True
 
-    log_file = os.path.join(log_dir, f"predict_{account_id}_{date_str}.log")
-    logger.add(log_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
-               level="INFO", rotation="00:00", retention="30 days", encoding="utf-8",
-               filter=file_filter)
-    events_file = os.path.join(log_dir, f"events_{account_id}_{date_str}.log")
-    logger.add(events_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
-               level="SUCCESS", rotation="00:00", retention="90 days", encoding="utf-8",
-               filter=lambda r: r["level"].name in ["SUCCESS", "ERROR", "CRITICAL"])
+    log_file = os.path.join(log_dir, f"predict_{account_id}.log")
+    logger.add(
+        BoundedFileSink(log_file),
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+        level="INFO",
+        filter=file_filter
+    )
+    events_file = os.path.join(log_dir, f"events_{account_id}.log")
+    logger.add(
+        BoundedFileSink(events_file),
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+        level="SUCCESS",
+        filter=lambda r: r["level"].name in ["SUCCESS", "ERROR", "CRITICAL"]
+    )
 
 
 def main():
@@ -729,9 +861,14 @@ def main():
         def mock_init(self_m, config):
             solo = config.get('solo_market', {})
             self_m.config = config
-            self_m.markets_input = solo.get('markets', [])
-            self_m.min_protection = solo.get('min_protection_amount', 500.0)
+            self_m.markets_input = PredictSoloMonitor._normalize_markets_input(solo.get('markets', []))
+            self_m.option_name = (solo.get('option') or '').strip()
+            self_m.order_side = str(solo.get('YON', PredictSoloMonitor.DEFAULT_SIDE)).strip().upper()
             self_m.order_shares = solo.get('order_shares', 101)
+            self_m.check_interval = int(solo.get('check_interval_seconds', 30))
+            self_m.target_offset = float(solo.get('target_offset_cents', 2.0)) / 100.0
+            self_m.lower_bound_offset = float(solo.get('lower_bound_offset_cents', 3.5)) / 100.0
+            self_m.upper_bound_offset = float(solo.get('upper_bound_offset_cents', 1.3)) / 100.0
             self_m.client = MockClient()
             self_m.orders = {}
             self_m.market_cache = {}

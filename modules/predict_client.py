@@ -83,6 +83,56 @@ class PredictClient:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
+    def _request_json(self, method: str, url: str, *, headers: Optional[Dict] = None,
+                      params: Optional[Dict] = None, json: Optional[Dict] = None,
+                      timeout: int = 10, max_retries: int = 3,
+                      label: str = "API") -> Optional[Dict]:
+        """带重试的 JSON 请求。"""
+        req_headers = headers or self.headers
+        last_error = None
+
+        for attempt in range(max_retries):
+            attempt_no = attempt + 1
+            is_last_attempt = attempt_no >= max_retries
+            try:
+                resp = requests.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    params=params,
+                    json=json,
+                    proxies=self.proxy,
+                    timeout=timeout
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                log_fn = logger.warning if is_last_attempt else logger.debug
+                log_fn(f"{label} 请求超时 ({attempt_no}/{max_retries}): {url}")
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                status = e.response.status_code if e.response is not None else "?"
+                body = e.response.text if e.response is not None else ""
+                # 对于不可重试的错误，只记录一次 warning。
+                if status in (400, 401, 403, 404):
+                    logger.warning(f"{label} HTTP 错误 ({attempt_no}/{max_retries}) {status}: {body}")
+                else:
+                    log_fn = logger.warning if is_last_attempt else logger.debug
+                    log_fn(f"{label} HTTP 错误 ({attempt_no}/{max_retries}) {status}: {body}")
+                if status in (400, 401, 403, 404):
+                    break
+            except Exception as e:
+                last_error = e
+                log_fn = logger.warning if is_last_attempt else logger.debug
+                log_fn(f"{label} 请求异常 ({attempt_no}/{max_retries}): {e}")
+
+            if attempt < max_retries - 1:
+                time.sleep(1.5)
+
+        logger.debug(f"{label} 请求最终失败: {last_error}")
+        return None
+
     def perform_approvals(self) -> bool:
         """执行所有交易所需的合约授权 (Approvals)"""
         # 如果使用 Predict Account，跳过授权步骤
@@ -235,42 +285,69 @@ class PredictClient:
     def fetch_market_info(self, id_or_token: str) -> Optional[Dict]:
         """获取市场详情"""
         try:
-            # 兼容处理：尝试直接获取
             url = f"{self.BASE_URL}/markets/{id_or_token}"
-            resp = requests.get(
+            data = self._request_json(
+                "GET",
                 url,
-                headers=self.headers,
-                proxies=self.proxy,
-                timeout=10
+                timeout=12,
+                max_retries=3,
+                label=f"Market Info {id_or_token}"
             )
-            if resp.status_code == 401 or resp.status_code == 403:
-                logger.error(f"API 认证失败 (Market Info): {resp.status_code} {resp.text}")
+            if not data:
                 return None
-            if resp.status_code == 500:
-                logger.debug(f"ID {id_or_token} 可能不是市场 ID (可能是 Token ID)，跳过详情获取")
-                return None
-            if not resp.ok:
-                logger.warning(f"获取市场详情失败 {id_or_token}: {resp.status_code} {resp.text}")
-                return None
-            
-            data = resp.json()
             return data.get("data") if isinstance(data, dict) and "data" in data else data
         except Exception as e:
             logger.debug(f"获取市场 {id_or_token} 信息时发生异常: {e}")
             return None
 
-    def fetch_orderbook(self, token_id: str) -> Optional[OrderBook]:
+    def fetch_category_by_slug(self, slug: str) -> Optional[Dict]:
+        """通过 slug 获取分类及其 markets。"""
+        try:
+            data = self._request_json(
+                "GET",
+                f"{self.BASE_URL}/categories/{slug}",
+                timeout=15,
+                max_retries=3,
+                label=f"Category {slug}"
+            )
+            if not data:
+                return None
+            return data.get("data") if isinstance(data, dict) and "data" in data else data
+        except Exception as e:
+            logger.debug(f"获取分类 {slug} 信息时发生异常: {e}")
+            return None
+
+    def search_markets(self, query: str, limit: int = 20) -> List[Dict]:
+        """搜索 markets，作为 slug 解析的兜底。"""
+        try:
+            data = self._request_json(
+                "GET",
+                f"{self.BASE_URL}/search",
+                params={"query": query, "limit": limit, "includeResolved": "true"},
+                timeout=12,
+                max_retries=3,
+                label=f"Search {query}"
+            )
+            if not data:
+                return []
+            inner = data.get("data", {}) if isinstance(data, dict) and "data" in data else data
+            return inner.get("markets", []) or []
+        except Exception as e:
+            logger.debug(f"搜索市场 {query} 时发生异常: {e}")
+            return []
+
+    def fetch_orderbook(self, market_id: str) -> Optional[OrderBook]:
         """获取订单簿"""
         try:
-            # Predict API 使用的是 market_id/token_id 获取订单簿
-            resp = requests.get(
-                f"{self.BASE_URL}/markets/{token_id}/orderbook",
-                headers=self.headers,
-                proxies=self.proxy,
-                timeout=10
+            data = self._request_json(
+                "GET",
+                f"{self.BASE_URL}/markets/{market_id}/orderbook",
+                timeout=12,
+                max_retries=3,
+                label=f"Orderbook {market_id}"
             )
-            resp.raise_for_status()
-            data = resp.json()
+            if not data:
+                return None
             # 兼容处理 {"success": true, "data": {"bids": ...}} 和 {"bids": ...}
             inner_data = data.get("data", {}) if isinstance(data, dict) and "data" in data else data
             
@@ -303,11 +380,8 @@ class PredictClient:
             
             return OrderBook(bids=bids, asks=asks, best_bid=best_bid, best_ask=best_ask)
             
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"获取订单簿 HTTP 错误 (MarketID: {token_id}): {e}")
-            return None
         except Exception as e:
-            logger.error(f"获取订单簿异常 (MarketID: {token_id}): {e}")
+            logger.error(f"获取订单簿异常 (MarketID: {market_id}): {e}")
             return None
 
     def place_limit_order(self, token_id: str, side: Side, amount: float, price: float, 

@@ -42,7 +42,14 @@ python3 solomarket.py --sim --config-file config/account_1.config.yaml
 ```yaml
 solo_market:
   markets:
-    - "https://predict.fun/market/cs2-prv-nip-2026-03-19:PARI"  URL + 选项名称
+    - "https://predict.fun/market/opensea-fdv-above-one-day-after-launch"
+  option: "500m"
+  YON: "NO"
+  order_shares: 101
+  target_offset_cents: 2.0
+  lower_bound_offset_cents: 3.5
+  upper_bound_offset_cents: 1.3
+  check_interval_seconds: 30
 ```
 
 
@@ -51,7 +58,12 @@ solo_market:
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | `order_shares` | 每次挂单的固定份额 | `101` |
-| `min_protection_amount` | 最小前方保护金额 ($) | `500` |
+| `option` | 多选市场的英文选项名 | `500m` |
+| `YON` | 买 `YES` 还是买 `NO` | `NO` |
+| `target_offset_cents` | 首次下单/重挂目标偏移（美分） | `2.0` |
+| `lower_bound_offset_cents` | 存活区间下限偏移（美分） | `3.5` |
+| `upper_bound_offset_cents` | 存活区间上限偏移（美分） | `1.3` |
+| `check_interval_seconds` | 订单检查间隔（秒） | `30` |
 
 ### 多账号
 
@@ -64,53 +76,37 @@ python3 solomarket.py --config-file config/account_2.config.yaml
 
 ## 挂单策略
 
-### 优先级
+### 核心原则
 
-1. **得分优先**：挂单价格必须在 `BestAsk - 0.06` (6 美分) 以内
-2. **保护其次**：在得分范围内，优先选择前方保护金额 ≥ `min_protection_amount` 的位置
+挂单价格的存活区间必须在 `[BestAsk - 0.035, BestAsk - 0.013]` 内。
 
-### 三种情况
+### 首次下单
 
-| 情况 | 行为 |
-|------|------|
-| ✅ 得分+保护都满足 | 在满足保护的最优位置挂单 |
-| ⚠️ 得分OK但保护不足 | 仍然挂单 (得分优先) |
-| 🔻 得分范围内无买单 | 直接在 BestAsk - 0.06 挂单 (保证得分) |
+首次下单按 `BestAsk - 0.02`（2 美分）挂单。
 
 ### 自动调整
 
-脚本每 **3 秒** 检查一次：
-- 已挂订单是否仍合格 → 不合格则撤单
-- **买3价格守卫**：如果当前已在买1-买3以内，且新价格是向前调整（更高），则**跳过改单**以减少频繁撤单。
-- 最佳价格是否变化（且触发后退或掉出买3） → 改单
+脚本每 **30 秒** 检查一次：
+- 已挂订单是否仍然在 `[BestAsk - 0.035, BestAsk - 0.013]` 存活区间内
+- 如果不合格，则撤单并按最新 `BestAsk - 0.02` 重新挂单
 
 ### Telegram 报告
 
 每 **2 小时** 自动发送一次状态报告，包含：
 - 账户余额 (可用/冻结/总计)
 - 挂单数量和总额
-- 每笔挂单详情 (市场、价格、排名、保护金额、已挂时长)
+- 每笔挂单详情 (市场、选项方向、价格、BestAsk、存活区间、已挂时长)
+
+### 日志
+
+- 每个账号只保留一份 `predict_<account>.log` 和一份 `events_<account>.log`
+- 两个日志文件都会限制在 **50KB** 以内，超出后自动覆盖最旧内容
 
 ---
 
-## 保护金额计算
+## NO 侧说明
 
-保护金额 = 挂单**前方**所有买单的总金额。
-
-采用 **First-In-Queue 假设**：
-- 只计算价格**严格高于**我们的档位金额
-- **同价位保护计为 $0**（假设我们排在最前）
-- 永远不挂买 1 价（避免被快速成交）
-
-```
-示例：
-  买1: 0.352 @ $800
-  买2: 0.351 @ $400
-  我们的挂单: 0.351
-
-  前方保护 = $800 (只有买1)
-  同价位保护 = $0
-```
+Predict API 的 orderbook 文档说明盘口价格默认基于 `YES` 返回；如果你配置 `YON: "NO"`，脚本会按文档里的补价逻辑把 `YES` 盘口换算成 `NO` 的 `BestAsk` 后再挂单。
 
 ---
 

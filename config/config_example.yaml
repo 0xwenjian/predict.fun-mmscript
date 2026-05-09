@@ -2,19 +2,31 @@
 # 复制此文件为 account_1.config.yaml 并修改
 
 solo_market:
-  # 市场列表 — 支持以下格式:
-  #   - "12474"         市场数字 ID (默认买第一个选项)
-  #   - "12474:NIP"     市场 ID + 选项名称
+  # 市场列表 — 支持市场 URL / slug / market_id
   markets:
-    - "12474:PARI"  # CS2: PARIVISION vs NIP
+    - "https://predict.fun/market/will-polymarket-launch-their-official-token-by"
 
-  # 最小前方保护金额 (美元)
-  # 优先级 2: 得分范围内有保护足够的位置时优先选那里
-  # 如果没有足够保护，仍会在得分范围内下单 (得分优先)
-  min_protection_amount: 500.0
+  # 多选市场的英文选项名
+  # 二元 YES/NO 市场可以直接写 YES 或 NO
+  option: "December 31, 2026"
+
+  # 买 YES 还是买 NO
+  YON: "YES"
 
   # 每次挂单的固定份额数量
   order_shares: 101
+
+  # 首次下单/重挂目标价 = BestAsk - 该偏移（单位：美分）
+  target_offset_cents: 2.0
+
+  # 存活区间下限 = BestAsk - 该偏移（单位：美分）
+  lower_bound_offset_cents: 3.5
+
+  # 存活区间上限 = BestAsk - 该偏移（单位：美分）
+  upper_bound_offset_cents: 1.3
+
+  # 检查间隔（秒）
+  check_interval_seconds: 30
 
 
 # Telegram 通知 (每 2 小时发送状态报告)

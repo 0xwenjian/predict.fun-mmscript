@@ -587,6 +587,27 @@ class PredictClient:
                 logger.error(f"响应内容: {e.response.text}")
             return False
 
+    def get_open_orders(self) -> list:
+        """Get all current open orders for the authenticated user"""
+        try:
+            headers = self._get_auth_headers()
+            resp = requests.get(
+                f"{self.BASE_URL}/orders?status=OPEN&first=200",
+                headers=headers,
+                proxies=self.proxy,
+                timeout=10
+            )
+            if resp.ok:
+                data = resp.json()
+                raw = data.get("data", []) if data else []
+                logger.debug(f"Open orders: {len(raw)} found")
+                return raw
+            logger.debug(f"Get open orders failed: {resp.status_code}")
+            return []
+        except Exception as e:
+            logger.debug(f"Get open orders error: {e}")
+            return []
+
     def get_balances(self) -> Dict:
         """获取个人余额和持仓 (使用 SDK 读取 USDT 返回实际余额)"""
         try:

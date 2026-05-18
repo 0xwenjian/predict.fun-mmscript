@@ -507,8 +507,25 @@ class PredictSoloMonitor:
 
     def _maintain_orders(self):
         """步骤 A: 维护现有订单 — 检查是否仍合格，价格是否需要调整"""
+        # 从API拉取当前OPEN订单列表，用于检测订单是否已被成交
+        open_orders_data = self.client.get_open_orders()
+        open_order_ids_set = {o.get('id') for o in open_orders_data if o.get('id')}
         for cache_key, order in list(self.orders.items()):
             try:
+                # === 新增：真实订单状态检查 ===
+                if open_order_ids_set and order.order_id not in open_order_ids_set:
+                    logger.warning(
+                        f"订单 {order.order_id} 不在API OPEN列表中，疑似已成交 "
+                        f"| {order.title[:20]} @ {order.price:.3f}"
+                    )
+                    del self.orders[cache_key]
+                    self._send_tg(
+                        f"⚠️ [订单已成交] {order.title[:30]} @ ${order.price:.3f}\n"
+                        f"   单号: {order.order_id}\n"
+                        f"   检测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    continue
+
                 minfo = self.market_cache.get(cache_key)
                 if not minfo:
                     continue
@@ -582,6 +599,22 @@ class PredictSoloMonitor:
     def send_status_report(self):
         """每 2 小时发送状态报告"""
         try:
+            # 同步订单状态：拉取API OPEN列表，清理已成交的
+            open_orders_data = self.client.get_open_orders()
+            open_order_ids = {o.get('id') for o in open_orders_data if o.get('id')}
+            if open_order_ids:
+                cleared = 0
+                for ck in list(self.orders.keys()):
+                    if self.orders[ck].order_id not in open_order_ids:
+                        logger.warning(
+                            f"[状态报告]清理已成交订单: {self.orders[ck].order_id} "
+                            f"({self.orders[ck].title[:20]})"
+                        )
+                        del self.orders[ck]
+                        cleared += 1
+                if cleared:
+                    logger.info(f"状态报告前清理了 {cleared} 个已成交订单")
+
             balances = self.client.get_balances()
             available = frozen = total = 0.0
             if balances:

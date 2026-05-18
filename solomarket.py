@@ -122,6 +122,9 @@ class PredictSoloMonitor:
         self.running = False
         self.last_report_time = 0
         self.report_interval = 2 * 3600  # 2 小时
+        # 下单失败退避
+        self.failed_market_keys: Dict[str, int] = {}  # market_key -> consecutive failures
+        self.backoff_market_keys: Dict[str, float] = {}  # market_key -> next_retry_time
 
     # ── 工具方法 ──────────────────────────────────────────────
 

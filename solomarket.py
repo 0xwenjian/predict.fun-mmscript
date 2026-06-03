@@ -626,18 +626,25 @@ class PredictSoloMonitor:
                 frozen = float(d.get('frozenBalance', 0)) / 1e6 if d.get('frozenBalance') else 0
                 total = available + frozen
 
-            order_total = sum(o.amount for o in self.orders.values())
+            # TG 报告必须以 API 返回的真实 OPEN 订单为准，不能用本地缓存 self.orders 作为对外口径。
+            # self.orders 只用于脚本内部维护；只有同时存在于 API OPEN 列表里的缓存订单，才展示在 TG 报告中。
+            open_order_ids = {str(o.get('id')) for o in open_orders_data if o.get('id')}
+            api_verified_orders = [
+                (ck, order) for ck, order in self.orders.items()
+                if str(order.order_id) in open_order_ids
+            ]
+            order_total = sum(o.amount for _, o in api_verified_orders)
 
             msg = f"📊 <b>predict.fun脚本监控</b>\n"
             msg += f"━━━━━━━━━━━━━━━\n"
             msg += f"💰 可用余额: ${available:.2f}\n"
             msg += f"🔒 冻结余额: ${frozen:.2f}\n"
             msg += f"💵 总余额: ${total:.2f}\n"
-            msg += f"📦 挂单数量: {len(self.orders)}\n"
+            msg += f"📦 挂单数量: {len(open_order_ids)}\n"
             msg += f"💼 挂单总额: ${order_total:.2f}\n"
             msg += f"━━━━━━━━━━━━━━━\n"
 
-            for ck, order in self.orders.items():
+            for ck, order in api_verified_orders:
                 hours = (time.time() - order.create_time) / 3600
                 minfo = self.market_cache.get(ck)
                 mid = minfo['market_id'] if minfo else '?'
@@ -661,14 +668,16 @@ class PredictSoloMonitor:
                 )
                 msg += f"   金额: ${order.amount:.0f} | 已挂: {hours:.1f}小时\n"
 
-            if not self.orders:
+            if not open_order_ids:
                 msg += f"\n⚠️ 当前无挂单\n"
+            elif len(api_verified_orders) < len(open_order_ids):
+                msg += f"\n⚠️ 有 {len(open_order_ids) - len(api_verified_orders)} 个 API OPEN 订单未在本地缓存中，详情请登录查看。\n"
 
             msg += f"\n━━━━━━━━━━━━━━━\n"
             msg += f"⏰ 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             msg += f"━━━━━━━━━━━━━━━"
             self._send_tg(msg)
-            logger.info(f"状态报告已发送 ({len(self.orders)}/{len(self.markets_input)})")
+            logger.info(f"状态报告已发送 ({len(open_order_ids)}/{len(self.markets_input)})")
         except Exception as e:
             logger.error(f"报告发送失败: {e}")
 
